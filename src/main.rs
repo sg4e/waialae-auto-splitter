@@ -132,13 +132,21 @@ fn main() -> std::io::Result<()> {
 }
 
     //LiveSplit server commands
+    #[allow(dead_code)]
     const START_TIMER: &str = "starttimer";
+    #[allow(dead_code)]
     const START_OR_SPLIT: &str = "startorsplit";
+    #[allow(dead_code)]
     const SPLIT: &str = "split";
+    #[allow(dead_code)]
     const UNSPLIT: &str = "unsplit";
+    #[allow(dead_code)]
     const SKIP_SPLIT: &str = "skipsplit";
+    #[allow(dead_code)]
     const PAUSE: &str = "pause";
+    #[allow(dead_code)]
     const RESUME: &str = "resume";
+    #[allow(dead_code)]
     const RESET: &str = "reset";
 
 struct Pixel {
@@ -149,6 +157,7 @@ struct Pixel {
     data: Vec<u8>,
 }
 
+#[allow(dead_code)]
 enum Color {
     Blue = 0,
     Green = 1,
@@ -207,8 +216,15 @@ impl Image {
     fn is_black(&self) -> bool {
         let threshold = 95; //percent
         let pixel_count : usize = self.rows.iter().map(|row| row.pixels.len()).sum();
-        let black_pixels : usize = self.rows.iter().map(|row| row.pixels.as_slice()).flatten().filter(|pixel| pixel.is_black()).count();
-        black_pixels * 100 / pixel_count >= threshold
+        let trigger : usize = pixel_count * threshold / 100;
+        let mut count : usize = 0;
+        for row in &self.rows {
+            count += row.pixels.iter().filter(|pix| pix.is_black()).count();
+            if count >= trigger {
+                return true;
+            }
+        };
+        false
     }
 }
 
