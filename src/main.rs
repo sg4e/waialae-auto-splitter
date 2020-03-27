@@ -33,16 +33,13 @@ const BYTE_SIZE: usize = 4;
 
 fn main() -> std::io::Result<()> {
     let mut all_displays = Display::all().unwrap();
-    println!("Number of displays: {}", all_displays.len());
     // get 2nd
     //all_displays.pop();
     let dis = all_displays.pop().unwrap();
-    println!("Width: {} Height: {}", dis.width(), dis.height());
     let mut cap = Capturer::new(dis).unwrap();
     let width = cap.width();
     let height = cap.height();
     let frame = cap.frame().unwrap();
-    println!("size: {} | {}", frame.len(), frame[1]);
     let mut bitmap_prefix_data : [u8; 138] = [
         0x42, 0x4D,             // Signature 'BM'
         0xaa, 0x00, 0x00, 0x00, // Size: 170 bytes
@@ -105,7 +102,6 @@ fn main() -> std::io::Result<()> {
             thread::spawn(move || {
                 loop {
                     let command: &str = rx.recv().unwrap();
-                    println!("{}", command);
                     //from LiveStream.Server readme: <command><space><parameters><\r\n>
                     stream.write_all(format!("{} \r\n", command).as_bytes()).unwrap_or_else(|error| {
                         println!("Error sending {} to LiveSplit: {}", command, error);
@@ -197,6 +193,7 @@ impl Row {
     }
 }
 
+#[allow(dead_code)]
 struct Image {
     height: usize,
     width: usize,
@@ -233,18 +230,4 @@ fn write_le_u32(offset: usize, value: usize, arr: &mut [u8]) -> () {
     arr[offset + 1] = (value >> (1 * 8) & 0xFF) as u8;
     arr[offset + 2] = (value >> (2 * 8) & 0xFF) as u8;
     arr[offset + 3] = (value >> (3 * 8) & 0xFF) as u8;
-}
-
-fn flip_for_bitmap(width: usize, frame_data: &[u8]) -> Vec<u8> {
-    let mut vec = Vec::with_capacity(frame_data.len());
-    println!("{}", frame_data.len());
-    let height = frame_data.len()/BYTE_SIZE/width;
-    for row in (0..height).rev() {
-        for pos in 0..(width*BYTE_SIZE) {
-            //for byte in 0..BYTE_SIZE {
-                vec.push(frame_data[row * width + pos /* BYTE_SIZE + byte*/]);
-            //}
-        }
-    }
-    vec
 }
