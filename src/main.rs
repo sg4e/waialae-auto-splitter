@@ -34,15 +34,20 @@ const BYTE_SIZE: usize = 4;
 const BITMAP_FILE : &str = "test.bmp";
 
 fn main() -> std::io::Result<()> {
-    let mut cap : Capturer = loop {
+    let input: UserInput = loop {
         //TODO get mouse coordinates with Windows API
+        let top_x = 80;
+        let top_y = 80;
+        let bottom_x = 800;
+        let bottom_y = 800;
+        let dimensions = Rectangle {top_x, top_y, bottom_x, bottom_y};
+
         let mut all_displays = Display::all().unwrap();
         // get 2nd
         //all_displays.pop();
         let dis = all_displays.pop().unwrap();
         let mut test_cap = Capturer::new(dis).unwrap();
         let width = test_cap.width();
-        let height = test_cap.height();
         let frame = test_cap.frame().unwrap();
         let mut bitmap_prefix_data: [u8; 138] = [
             0x42, 0x4D,             // Signature 'BM'
@@ -87,14 +92,18 @@ fn main() -> std::io::Result<()> {
             // 0x00, 0x00, 0xFF, 0xFF,
             // 0xFF, 0xFF, 0xFF, 0xFF  // Top right pixel
         ];
-        write_le_u32(2, bitmap_prefix_data.len() + frame.len(), &mut bitmap_prefix_data);
-        write_le_u32(18, width, &mut bitmap_prefix_data);
-        write_le_u32(22, height, &mut bitmap_prefix_data);
-
         let mut file = File::create(BITMAP_FILE)?;
-        let image = Image::from_byte_array(width, &*frame);
+        let mut image = Image::from_byte_array(width, &*frame);
+        image.crop(&dimensions);
+
+        write_le_u32(18, image.width, &mut bitmap_prefix_data);
+        write_le_u32(22, image.height, &mut bitmap_prefix_data);
+
         let image_bytes: Vec<u8> = image.rows.iter().rev().map(|r| r.to_byte_array()).flatten().collect();
+
         write_le_u32(34, image_bytes.len(), &mut bitmap_prefix_data);
+        write_le_u32(2, bitmap_prefix_data.len() + image_bytes.len(), &mut bitmap_prefix_data);
+
         file.write_all(&bitmap_prefix_data)?;
         file.write_all(image_bytes.as_ref())?;
         file.flush()?;
@@ -104,9 +113,10 @@ fn main() -> std::io::Result<()> {
         let mut response = String::new();
         io::stdin().read_line(&mut response).unwrap();
         if response.trim().is_empty() || response.to_lowercase().starts_with("y") {
-            break test_cap;
+            break UserInput {dimensions, cap: test_cap};
         }
     };
+    let mut cap = input.cap;
 
     //init thread for connection to LiveSplit.Server
     match TcpStream::connect("localhost:16834") {
@@ -124,7 +134,8 @@ fn main() -> std::io::Result<()> {
             loop {
                 let width = cap.width();
                 let screenshot = cap.frame()?;
-                let waialae_image = Image::from_byte_array(width, &*screenshot);
+                let mut waialae_image = Image::from_byte_array(width, &*screenshot);
+                waialae_image.crop(&input.dimensions);
                 if waialae_image.is_black() {
                     livesplit_socket.send(SPLIT).unwrap();
                     thread::sleep(time::Duration::from_secs(6));
@@ -139,6 +150,11 @@ fn main() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+struct UserInput {
+    dimensions: Rectangle,
+    cap: Capturer,
 }
 
     //LiveSplit server commands
@@ -173,6 +189,13 @@ enum Color {
     Green = 1,
     Red = 2,
     Alpha = 3
+}
+
+struct Rectangle {
+    top_x: usize,
+    top_y: usize,
+    bottom_x: usize,
+    bottom_y: usize
 }
 
 impl Pixel {
@@ -236,6 +259,29 @@ impl Image {
             }
         };
         false
+    }
+
+    fn crop(&mut self, dim: &Rectangle) -> () {
+        for _n in 0..dim.top_y {
+            self.rows.remove(0);
+        }
+        for _n in dim.bottom_y..self.height {
+            let size = self.rows.len();
+            self.rows.remove(size-1);
+        }
+        for _n in 0..dim.top_x {
+            for row in &mut self.rows {
+                row.pixels.remove(0);
+            }
+        }
+        for _n in dim.bottom_x..self.width {
+            for row in &mut self.rows {
+                let size = row.pixels.len();
+                row.pixels.remove(size-1);
+            }
+        }
+        self.width = dim.bottom_x - dim.top_x;
+        self.height = dim.bottom_y - dim.top_y;
     }
 }
 
