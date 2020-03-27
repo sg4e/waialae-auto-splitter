@@ -94,7 +94,7 @@ fn main() -> std::io::Result<()> {
         ];
         let mut file = File::create(BITMAP_FILE)?;
         let mut image = Image::from_byte_array(width, &*frame);
-        image.crop(&dimensions);
+        image.set_sub_frame(dimensions.clone());
 
         write_le_u32(18, image.width, &mut bitmap_prefix_data);
         write_le_u32(22, image.height, &mut bitmap_prefix_data);
@@ -128,19 +128,20 @@ fn main() -> std::io::Result<()> {
                     //from LiveStream.Server readme: <command><space><parameters><\r\n>
                     stream.write_all(format!("{} \r\n", command).as_bytes()).unwrap_or_else(|error| {
                         println!("Error sending {} to LiveSplit: {}", command, error);
-                    })
+                    });
+                    stream.flush().unwrap();
                 }
             });
             loop {
                 let width = cap.width();
                 let screenshot = cap.frame()?;
                 let mut waialae_image = Image::from_byte_array(width, &*screenshot);
-                waialae_image.crop(&input.dimensions);
+                waialae_image.set_sub_frame(input.dimensions.clone());
                 if waialae_image.is_black() {
                     livesplit_socket.send(SPLIT).unwrap();
                     thread::sleep(time::Duration::from_secs(6));
                 } else {
-                    thread::sleep(time::Duration::from_millis(1000 / 120));
+                    thread::sleep(time::Duration::from_millis(1000 / 60));
                 }
             }
         }
@@ -191,6 +192,7 @@ enum Color {
     Alpha = 3
 }
 
+#[derive(Clone)]
 struct Rectangle {
     top_x: usize,
     top_y: usize,
@@ -214,11 +216,13 @@ impl Pixel {
 
 struct Row {
     pixels: Vec<Pixel>,
+    start: usize, //inclusive
+    end: usize //exclusive
 }
 
 impl Row {
     fn from_byte_array(arr: &[u8]) -> Row {
-        let mut row = Row {pixels: Vec::with_capacity(arr.len()/BYTE_SIZE)};
+        let mut row = Row {pixels: Vec::with_capacity(arr.len()/BYTE_SIZE), start: 0, end: arr.len()/BYTE_SIZE};
         for p in arr.chunks(BYTE_SIZE) {
             row.pixels.push(Pixel {data: p.to_vec()});
         }
@@ -226,7 +230,17 @@ impl Row {
     }
 
     fn to_byte_array(&self) -> Vec<u8> {
-        self.pixels.iter().map(|p| p.data.to_vec()).flatten().collect()
+        self.pixels[self.start..self.end].iter().map(|p| p.data.to_vec()).flatten().collect()
+    }
+
+    fn count_black_pixels(&self) -> usize {
+        let mut count = 0usize;
+        for i in self.start..self.end {
+            if self.pixels[i].is_black() {
+                count += 1;
+            }
+        }
+        count
     }
 }
 
@@ -235,12 +249,14 @@ struct Image {
     height: usize,
     width: usize,
     rows: Vec<Row>,
+    sub_frame: Rectangle,
 }
 
 impl Image {
     fn from_byte_array(width: usize, arr: &[u8]) -> Image {
         let height = arr.len()/BYTE_SIZE/width;
-        let mut im = Image {height, width, rows: Vec::with_capacity(height)};
+        let mut im = Image {height, width, rows: Vec::with_capacity(height),
+            sub_frame: Rectangle {top_x: 0, top_y: 0, bottom_x: width, bottom_y: height} };
         for row in arr.chunks(im.width * BYTE_SIZE) {
             im.rows.push(Row::from_byte_array(row));
         }
@@ -249,11 +265,12 @@ impl Image {
 
     fn is_black(&self) -> bool {
         let threshold = 95; //percent
-        let pixel_count : usize = self.rows.iter().map(|row| row.pixels.len()).sum();
+        let pixel_count : usize = self.width * self.height;
         let trigger : usize = pixel_count * threshold / 100;
         let mut count : usize = 0;
-        for row in &self.rows {
-            count += row.pixels.iter().filter(|pix| pix.is_black()).count();
+        for i in self.sub_frame.top_y..self.sub_frame.bottom_y {
+            let row = &self.rows[i];
+            count += row.count_black_pixels();
             if count >= trigger {
                 return true;
             }
@@ -261,28 +278,16 @@ impl Image {
         false
     }
 
-    fn crop(&mut self, dim: &Rectangle) -> () {
-        for _n in 0..dim.top_y {
-            self.rows.remove(0);
+    fn set_sub_frame(&mut self, dim: Rectangle) -> () {
+        for row in &mut self.rows {
+            row.start = dim.top_x;
+            row.end = dim.bottom_y;
         }
-        for _n in dim.bottom_y..self.height {
-            let size = self.rows.len();
-            self.rows.remove(size-1);
-        }
-        for _n in 0..dim.top_x {
-            for row in &mut self.rows {
-                row.pixels.remove(0);
-            }
-        }
-        for _n in dim.bottom_x..self.width {
-            for row in &mut self.rows {
-                let size = row.pixels.len();
-                row.pixels.remove(size-1);
-            }
-        }
-        self.width = dim.bottom_x - dim.top_x;
         self.height = dim.bottom_y - dim.top_y;
+        self.width = dim.bottom_x - dim.top_x;
+        self.sub_frame = dim;
     }
+
 }
 
 fn write_le_u32(offset: usize, value: usize, arr: &mut [u8]) -> () {
