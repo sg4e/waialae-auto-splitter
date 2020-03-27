@@ -25,6 +25,9 @@
 use scrap::*;
 use std::fs::File;
 use std::io::prelude::*;
+use std::{thread, time};
+use std::net::{TcpStream};
+use std::sync::mpsc;
 
 const BYTE_SIZE: usize = 4;
 
@@ -95,8 +98,48 @@ fn main() -> std::io::Result<()> {
     file.write_all(image_bytes.as_ref())?;
     file.flush()?;
 
+    //init thread for connection to LiveSplit.Server
+    match TcpStream::connect("localhost:16834") {
+        Ok(mut stream) => {
+            let (livesplit_socket, rx) = mpsc::channel();
+            thread::spawn(move || {
+                loop {
+                    let command: &str = rx.recv().unwrap();
+                    println!("{}", command);
+                    //from LiveStream.Server readme: <command><space><parameters><\r\n>
+                    stream.write_all(format!("{} \r\n", command).as_bytes()).unwrap_or_else(|error| {
+                        println!("Error sending {} to LiveSplit: {}", command, error);
+                    })
+                }
+            });
+            loop {
+                let screenshot = cap.frame()?;
+                let waialae_image = Image::from_byte_array(width, &*screenshot);
+                if waialae_image.is_black() {
+                    livesplit_socket.send(SPLIT).unwrap();
+                    thread::sleep(time::Duration::from_secs(6));
+                } else {
+                    thread::sleep(time::Duration::from_millis(1000 / 120));
+                }
+            }
+        }
+        Err(e) => {
+            println!("Failed to connect to LiveSplit Server: {}", e);
+        }
+    }
+
     Ok(())
 }
+
+    //LiveSplit server commands
+    const START_TIMER: &str = "starttimer";
+    const START_OR_SPLIT: &str = "startorsplit";
+    const SPLIT: &str = "split";
+    const UNSPLIT: &str = "unsplit";
+    const SKIP_SPLIT: &str = "skipsplit";
+    const PAUSE: &str = "pause";
+    const RESUME: &str = "resume";
+    const RESET: &str = "reset";
 
 struct Pixel {
     // b: u8,
@@ -114,8 +157,16 @@ enum Color {
 }
 
 impl Pixel {
+
     fn get(&self, color: Color) -> u8 {
         self.data[color as usize]
+    }
+
+    fn is_black(&self) -> bool {
+        const BLACK_THRESHOLD: u8 = 50;
+        self.get(Color::Blue) < BLACK_THRESHOLD &&
+            self.get(Color::Green) < BLACK_THRESHOLD &&
+            self.get(Color::Red) < BLACK_THRESHOLD
     }
 }
 
@@ -151,6 +202,13 @@ impl Image {
             im.rows.push(Row::from_byte_array(row));
         }
         im
+    }
+
+    fn is_black(&self) -> bool {
+        let threshold = 95; //percent
+        let pixel_count : usize = self.rows.iter().map(|row| row.pixels.len()).sum();
+        let black_pixels : usize = self.rows.iter().map(|row| row.pixels.as_slice()).flatten().filter(|pixel| pixel.is_black()).count();
+        black_pixels * 100 / pixel_count >= threshold
     }
 }
 
