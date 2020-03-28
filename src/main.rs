@@ -99,13 +99,14 @@ fn main() -> std::io::Result<()> {
         write_le_u32(18, image.width as u32, &mut bitmap_prefix_data);
         write_le_u32(22, image.height as u32, &mut bitmap_prefix_data);
 
-        let image_bytes: Vec<u8> = image.rows.iter().rev().map(|r| r.to_byte_array()).flatten().collect();
-
-        write_le_u32(34, image_bytes.len() as u32, &mut bitmap_prefix_data);
-        write_le_u32(2, (bitmap_prefix_data.len() + image_bytes.len()) as u32, &mut bitmap_prefix_data);
+        let image_total_bytes = image.total_bytes();
+        write_le_u32(34, image_total_bytes as u32, &mut bitmap_prefix_data);
+        write_le_u32(2, (bitmap_prefix_data.len() + image_total_bytes) as u32, &mut bitmap_prefix_data);
 
         file.write_all(&bitmap_prefix_data)?;
-        file.write_all(image_bytes.as_ref())?;
+        for row in image.rows.iter().rev() {
+            file.write_all(row.to_byte_array())?;
+        }
         file.flush()?;
         print!("An image of the capture area has been printed to {}. \
         Does this image encapsulate the entirety of the gamefeed and nothing else? [Y/n] ", BITMAP_FILE);
@@ -176,21 +177,10 @@ struct UserInput {
     #[allow(dead_code)]
     const RESET: &str = "reset";
 
-struct Pixel {
-    // b: u8,
-    // g: u8,
-    // r: u8,
-    // a: u8,
-    data: Vec<u8>,
-}
-
-#[allow(dead_code)]
-enum Color {
-    Blue = 0,
-    Green = 1,
-    Red = 2,
-    Alpha = 3
-}
+const BLUE_INDEX: usize = 0;
+const GREEN_INDEX: usize = 1;
+const RED_INDEX: usize = 2;
+//Alpha = 3
 
 #[derive(Clone)]
 struct Rectangle {
@@ -200,59 +190,56 @@ struct Rectangle {
     bottom_y: usize
 }
 
-impl Pixel {
-
-    fn get(&self, color: Color) -> u8 {
-        self.data[color as usize]
-    }
-
-    fn is_black(&self) -> bool {
-        const BLACK_THRESHOLD: u8 = 50;
-        self.get(Color::Blue) < BLACK_THRESHOLD &&
-            self.get(Color::Green) < BLACK_THRESHOLD &&
-            self.get(Color::Red) < BLACK_THRESHOLD
-    }
+fn is_black(pixel: &[u8]) -> bool {
+    const BLACK_THRESHOLD: u8 = 50;
+    pixel[BLUE_INDEX] < BLACK_THRESHOLD &&
+        pixel[GREEN_INDEX] < BLACK_THRESHOLD &&
+        pixel[RED_INDEX] < BLACK_THRESHOLD
 }
 
-struct Row {
-    pixels: Vec<Pixel>,
-    start: usize, //inclusive
-    end: usize //exclusive
+struct Row<'a> {
+    pixels: &'a[u8],
+    start: usize, //inclusive, in bytes, not pixels
+    end: usize //exclusive, in bytes, not pixels
 }
 
-impl Row {
+impl Row<'_> {
     fn from_byte_array(arr: &[u8]) -> Row {
-        let mut row = Row {pixels: Vec::with_capacity(arr.len()/PIXEL_SIZE), start: 0, end: arr.len()/PIXEL_SIZE};
-        for p in arr.chunks(PIXEL_SIZE) {
-            row.pixels.push(Pixel {data: p.to_vec()});
-        }
+        let row = Row {pixels: arr, start: 0, end: arr.len()};
         row
     }
 
-    fn to_byte_array(&self) -> Vec<u8> {
-        self.pixels[self.start..self.end].iter().map(|p| p.data.to_vec()).flatten().collect()
+    fn to_byte_array(&self) -> &[u8] {
+        self.pixels[self.start..self.end].as_ref()
     }
 
     fn count_black_pixels(&self) -> usize {
         let mut count = 0usize;
-        for i in self.start..self.end {
-            if self.pixels[i].is_black() {
+        for pixel in self.pixels[self.start..self.end].chunks(PIXEL_SIZE) {
+            if is_black(pixel) {
                 count += 1;
             }
         }
         count
     }
+
+    fn set_start(&mut self, start: usize) -> () {
+        self.start = start * PIXEL_SIZE;
+    }
+
+    fn set_end(&mut self, end: usize) -> () {
+        self.end = end * PIXEL_SIZE;
+    }
 }
 
-#[allow(dead_code)]
-struct Image {
+struct Image<'a> {
     height: usize,
     width: usize,
-    rows: Vec<Row>,
+    rows: Vec<Row<'a>>,
     sub_frame: Rectangle,
 }
 
-impl Image {
+impl Image<'_> {
     fn from_byte_array(width: usize, arr: &[u8]) -> Image {
         let height = arr.len()/PIXEL_SIZE/width;
         let mut im = Image {height, width, rows: Vec::with_capacity(height),
@@ -280,12 +267,16 @@ impl Image {
 
     fn set_sub_frame(&mut self, dim: Rectangle) -> () {
         for row in &mut self.rows {
-            row.start = dim.top_x;
-            row.end = dim.bottom_y;
+            row.set_start(dim.top_x);
+            row.set_end(dim.bottom_y);
         }
         self.height = dim.bottom_y - dim.top_y;
         self.width = dim.bottom_x - dim.top_x;
         self.sub_frame = dim;
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.height * self.width * PIXEL_SIZE
     }
 
 }
