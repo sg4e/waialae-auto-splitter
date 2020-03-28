@@ -30,7 +30,7 @@ use std::net::{TcpStream};
 use std::sync::mpsc;
 use std::io;
 
-const BYTE_SIZE: usize = 4;
+const PIXEL_SIZE: usize = 4;
 const BITMAP_FILE : &str = "test.bmp";
 
 fn main() -> std::io::Result<()> {
@@ -96,13 +96,13 @@ fn main() -> std::io::Result<()> {
         let mut image = Image::from_byte_array(width, &*frame);
         image.set_sub_frame(dimensions.clone());
 
-        write_le_u32(18, image.width, &mut bitmap_prefix_data);
-        write_le_u32(22, image.height, &mut bitmap_prefix_data);
+        write_le_u32(18, image.width as u32, &mut bitmap_prefix_data);
+        write_le_u32(22, image.height as u32, &mut bitmap_prefix_data);
 
         let image_bytes: Vec<u8> = image.rows.iter().rev().map(|r| r.to_byte_array()).flatten().collect();
 
-        write_le_u32(34, image_bytes.len(), &mut bitmap_prefix_data);
-        write_le_u32(2, bitmap_prefix_data.len() + image_bytes.len(), &mut bitmap_prefix_data);
+        write_le_u32(34, image_bytes.len() as u32, &mut bitmap_prefix_data);
+        write_le_u32(2, (bitmap_prefix_data.len() + image_bytes.len()) as u32, &mut bitmap_prefix_data);
 
         file.write_all(&bitmap_prefix_data)?;
         file.write_all(image_bytes.as_ref())?;
@@ -222,8 +222,8 @@ struct Row {
 
 impl Row {
     fn from_byte_array(arr: &[u8]) -> Row {
-        let mut row = Row {pixels: Vec::with_capacity(arr.len()/BYTE_SIZE), start: 0, end: arr.len()/BYTE_SIZE};
-        for p in arr.chunks(BYTE_SIZE) {
+        let mut row = Row {pixels: Vec::with_capacity(arr.len()/PIXEL_SIZE), start: 0, end: arr.len()/PIXEL_SIZE};
+        for p in arr.chunks(PIXEL_SIZE) {
             row.pixels.push(Pixel {data: p.to_vec()});
         }
         row
@@ -254,10 +254,10 @@ struct Image {
 
 impl Image {
     fn from_byte_array(width: usize, arr: &[u8]) -> Image {
-        let height = arr.len()/BYTE_SIZE/width;
+        let height = arr.len()/PIXEL_SIZE/width;
         let mut im = Image {height, width, rows: Vec::with_capacity(height),
             sub_frame: Rectangle {top_x: 0, top_y: 0, bottom_x: width, bottom_y: height} };
-        for row in arr.chunks(im.width * BYTE_SIZE) {
+        for row in arr.chunks(im.width * PIXEL_SIZE) {
             im.rows.push(Row::from_byte_array(row));
         }
         im
@@ -290,7 +290,7 @@ impl Image {
 
 }
 
-fn write_le_u32(offset: usize, value: usize, arr: &mut [u8]) -> () {
+fn write_le_u32(offset: usize, value: u32, arr: &mut [u8]) -> () {
     arr[offset + 0] = (value >> 0 & 0xFF) as u8;
     arr[offset + 1] = (value >> (1 * 8) & 0xFF) as u8;
     arr[offset + 2] = (value >> (2 * 8) & 0xFF) as u8;
