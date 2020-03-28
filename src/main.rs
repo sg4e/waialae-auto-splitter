@@ -22,7 +22,7 @@
  * THE SOFTWARE.
  */
 
-use scrap::*;
+use captrs::*;
 use std::fs::File;
 use std::io::prelude::*;
 use std::{thread, time};
@@ -42,13 +42,11 @@ fn main() -> std::io::Result<()> {
         let bottom_y = 800;
         let dimensions = Rectangle {top_x, top_y, bottom_x, bottom_y};
 
-        let mut all_displays = Display::all().unwrap();
-        // get 2nd
-        //all_displays.pop();
-        let dis = all_displays.pop().unwrap();
-        let mut test_cap = Capturer::new(dis).unwrap();
-        let width = test_cap.width();
-        let frame = test_cap.frame().unwrap();
+        let mut test_cap = Capturer::new(0).unwrap();
+        thread::sleep(time::Duration::from_millis(1000));
+        test_cap.capture_store_frame().unwrap();
+        let frame = test_cap.get_stored_frame().unwrap();
+        let (width, height) = test_cap.geometry();
         let mut bitmap_prefix_data: [u8; 138] = [
             0x42, 0x4D,             // Signature 'BM'
             0xaa, 0x00, 0x00, 0x00, // Size: 170 bytes
@@ -93,7 +91,8 @@ fn main() -> std::io::Result<()> {
             // 0xFF, 0xFF, 0xFF, 0xFF  // Top right pixel
         ];
         let mut file = File::create(BITMAP_FILE)?;
-        let mut image = Image::from_byte_array(width, &*frame);
+        println!("{}", width);
+        let mut image = Image::from_byte_array(width as usize, frame);
         image.set_sub_frame(dimensions.clone());
 
         write_le_u32(18, image.width as u32, &mut bitmap_prefix_data);
@@ -104,8 +103,8 @@ fn main() -> std::io::Result<()> {
         write_le_u32(2, (bitmap_prefix_data.len() + image_total_bytes) as u32, &mut bitmap_prefix_data);
 
         file.write_all(&bitmap_prefix_data)?;
-        for row in image.rows.iter().rev() {
-            file.write_all(row.to_byte_array())?;
+        for row in image.get_visible_rows().iter().rev() {
+            file.write_all(row.to_byte_array().as_slice())?;
         }
         file.flush()?;
         print!("An image of the capture area has been printed to {}. \
@@ -134,9 +133,15 @@ fn main() -> std::io::Result<()> {
                 }
             });
             loop {
-                let width = cap.width();
-                let screenshot = cap.frame()?;
-                let mut waialae_image = Image::from_byte_array(width, &*screenshot);
+                let (width, height) = cap.geometry();
+                let cap_result = cap.capture_store_frame();
+                if cap_result.is_err() {
+                    println!("No screen update");
+                    thread::sleep(time::Duration::from_millis(1000 / 60));
+                    continue;
+                }
+                let screenshot = cap.get_stored_frame().unwrap();
+                let mut waialae_image = Image::from_byte_array(width as usize, &screenshot);
                 waialae_image.set_sub_frame(input.dimensions.clone());
                 if waialae_image.is_black() {
                     livesplit_socket.send(SPLIT).unwrap();
@@ -190,32 +195,43 @@ struct Rectangle {
     bottom_y: usize
 }
 
-fn is_black(pixel: &[u8]) -> bool {
+fn is_black(pixel: &Bgr8) -> bool {
     const BLACK_THRESHOLD: u8 = 50;
-    pixel[BLUE_INDEX] < BLACK_THRESHOLD &&
-        pixel[GREEN_INDEX] < BLACK_THRESHOLD &&
-        pixel[RED_INDEX] < BLACK_THRESHOLD
+    pixel.b < BLACK_THRESHOLD &&
+        pixel.g < BLACK_THRESHOLD &&
+        pixel.r < BLACK_THRESHOLD
 }
 
+// fn bgr8_to_bytes<'a>(bgr8: &'a Bgr8) -> &'a[u8] {
+//     &[bgr8.b, bgr8.g, bgr8.r, bgr8.a]
+// }
+
 struct Row<'a> {
-    pixels: &'a[u8],
-    start: usize, //inclusive, in bytes, not pixels
-    end: usize //exclusive, in bytes, not pixels
+    pixels: &'a[Bgr8],
+    start: usize, //inclusive, in pixels
+    end: usize //exclusive, in pixels
 }
 
 impl Row<'_> {
-    fn from_byte_array(arr: &[u8]) -> Row {
+    fn from_byte_array(arr: &[Bgr8]) -> Row {
         let row = Row {pixels: arr, start: 0, end: arr.len()};
         row
     }
 
-    fn to_byte_array(&self) -> &[u8] {
-        self.pixels[self.start..self.end].as_ref()
+    fn to_byte_array(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity((self.end - self.start) * PIXEL_SIZE);
+        for pixel in self.pixels[self.start..self.end].iter() {
+            bytes.push(pixel.b);
+            bytes.push(pixel.g);
+            bytes.push(pixel.r);
+            bytes.push(pixel.a);
+        }
+        bytes
     }
 
     fn count_black_pixels(&self) -> usize {
         let mut count = 0usize;
-        for pixel in self.pixels[self.start..self.end].chunks(PIXEL_SIZE) {
+        for pixel in self.pixels[self.start..self.end].iter() {
             if is_black(pixel) {
                 count += 1;
             }
@@ -224,11 +240,11 @@ impl Row<'_> {
     }
 
     fn set_start(&mut self, start: usize) -> () {
-        self.start = start * PIXEL_SIZE;
+        self.start = start;
     }
 
     fn set_end(&mut self, end: usize) -> () {
-        self.end = end * PIXEL_SIZE;
+        self.end = end;
     }
 }
 
@@ -240,11 +256,11 @@ struct Image<'a> {
 }
 
 impl Image<'_> {
-    fn from_byte_array(width: usize, arr: &[u8]) -> Image {
-        let height = arr.len()/PIXEL_SIZE/width;
+    fn from_byte_array(width: usize, arr: &[Bgr8]) -> Image {
+        let height = arr.len()/width;
         let mut im = Image {height, width, rows: Vec::with_capacity(height),
             sub_frame: Rectangle {top_x: 0, top_y: 0, bottom_x: width, bottom_y: height} };
-        for row in arr.chunks(im.width * PIXEL_SIZE) {
+        for row in arr.chunks(im.width) {
             im.rows.push(Row::from_byte_array(row));
         }
         im
@@ -263,6 +279,10 @@ impl Image<'_> {
             }
         };
         false
+    }
+
+    fn get_visible_rows<'a>(&'a self) -> &[Row] {
+        self.rows[self.sub_frame.top_y..self.sub_frame.bottom_y].as_ref()
     }
 
     fn set_sub_frame(&mut self, dim: Rectangle) -> () {
