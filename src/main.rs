@@ -29,95 +29,107 @@ use std::{thread, time};
 use std::net::{TcpStream};
 use std::sync::mpsc;
 use std::io;
+use std::io::ErrorKind::WouldBlock;
+use std::process::exit;
 
 const PIXEL_SIZE: usize = 4;
 const BITMAP_FILE : &str = "test.bmp";
+const SCREEN_REFRESH_RATE : usize = 60;
+const CAPTURE_SAMPLE_RATE : usize = SCREEN_REFRESH_RATE * 2;
+const CAPTURE_SAMPLE_DELAY_MILLIS : u64 = 1000 / CAPTURE_SAMPLE_RATE as u64;
+const DELAY_MILLIS_AFTER_HOLE_SPLIT : u64 = 6 * 1000;
 
 fn main() -> std::io::Result<()> {
+    //TODO get mouse coordinates with Windows API
+    let top_x = 80;
+    let top_y = 80;
+    let bottom_x = 800;
+    let bottom_y = 800;
+    let dimensions = Rectangle {top_x, top_y, bottom_x, bottom_y};
+
+    let mut all_displays = Display::all().unwrap();
+    // get 2nd
+    //all_displays.pop();
+    let dis = all_displays.pop().unwrap();
+    let mut cap = Capturer::new(dis).unwrap();
+    let width = cap.width();
     let input: UserInput = loop {
-        //TODO get mouse coordinates with Windows API
-        let top_x = 80;
-        let top_y = 80;
-        let bottom_x = 800;
-        let bottom_y = 800;
-        let dimensions = Rectangle {top_x, top_y, bottom_x, bottom_y};
+        match cap.frame() {
+            Ok(frame) => {
+                let mut bitmap_prefix_data: [u8; 138] = [
+                    0x42, 0x4D,             // Signature 'BM'
+                    0xaa, 0x00, 0x00, 0x00, // Size: 170 bytes
+                    0x00, 0x00,             // Unused
+                    0x00, 0x00,             // Unused
+                    0x8a, 0x00, 0x00, 0x00, // Offset to image data
 
-        let mut all_displays = Display::all().unwrap();
-        // get 2nd
-        //all_displays.pop();
-        let dis = all_displays.pop().unwrap();
-        let mut test_cap = Capturer::new(dis).unwrap();
-        let width = test_cap.width();
-        let frame = test_cap.frame().unwrap();
-        let mut bitmap_prefix_data: [u8; 138] = [
-            0x42, 0x4D,             // Signature 'BM'
-            0xaa, 0x00, 0x00, 0x00, // Size: 170 bytes
-            0x00, 0x00,             // Unused
-            0x00, 0x00,             // Unused
-            0x8a, 0x00, 0x00, 0x00, // Offset to image data
+                    0x7c, 0x00, 0x00, 0x00, // DIB header size (124 bytes)
+                    0x04, 0x00, 0x00, 0x00, // Width (4px)
+                    0x02, 0x00, 0x00, 0x00, // Height (2px)
+                    0x01, 0x00,             // Planes (1)
+                    0x20, 0x00,             // Bits per pixel (32)
+                    0x03, 0x00, 0x00, 0x00, // Format (bitfield = use bitfields | no compression)
+                    0x20, 0x00, 0x00, 0x00, // Image raw size (32 bytes)
+                    0x13, 0x0B, 0x00, 0x00, // Horizontal print resolution (2835 = 72dpi * 39.3701)
+                    0x13, 0x0B, 0x00, 0x00, // Vertical print resolution (2835 = 72dpi * 39.3701)
+                    0x00, 0x00, 0x00, 0x00, // Colors in palette (none)
+                    0x00, 0x00, 0x00, 0x00, // Important colors (0 = all)
+                    0x00, 0x00, 0xFF, 0x00, // R bitmask (00FF0000)
+                    0x00, 0xFF, 0x00, 0x00, // G bitmask (0000FF00)
+                    0xFF, 0x00, 0x00, 0x00, // B bitmask (000000FF)
+                    0x00, 0x00, 0x00, 0x00, // A bitmask (FF000000)
+                    0x42, 0x47, 0x52, 0x73, // sRGB color space
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Unused R, G, B entries for color space
+                    0x00, 0x00, 0x00, 0x00, // Unused Gamma X entry for color space
+                    0x00, 0x00, 0x00, 0x00, // Unused Gamma Y entry for color space
+                    0x00, 0x00, 0x00, 0x00, // Unused Gamma Z entry for color space
 
-            0x7c, 0x00, 0x00, 0x00, // DIB header size (124 bytes)
-            0x04, 0x00, 0x00, 0x00, // Width (4px)
-            0x02, 0x00, 0x00, 0x00, // Height (2px)
-            0x01, 0x00,             // Planes (1)
-            0x20, 0x00,             // Bits per pixel (32)
-            0x03, 0x00, 0x00, 0x00, // Format (bitfield = use bitfields | no compression)
-            0x20, 0x00, 0x00, 0x00, // Image raw size (32 bytes)
-            0x13, 0x0B, 0x00, 0x00, // Horizontal print resolution (2835 = 72dpi * 39.3701)
-            0x13, 0x0B, 0x00, 0x00, // Vertical print resolution (2835 = 72dpi * 39.3701)
-            0x00, 0x00, 0x00, 0x00, // Colors in palette (none)
-            0x00, 0x00, 0x00, 0x00, // Important colors (0 = all)
-            0x00, 0x00, 0xFF, 0x00, // R bitmask (00FF0000)
-            0x00, 0xFF, 0x00, 0x00, // G bitmask (0000FF00)
-            0xFF, 0x00, 0x00, 0x00, // B bitmask (000000FF)
-            0x00, 0x00, 0x00, 0x00, // A bitmask (FF000000)
-            0x42, 0x47, 0x52, 0x73, // sRGB color space
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Unused R, G, B entries for color space
-            0x00, 0x00, 0x00, 0x00, // Unused Gamma X entry for color space
-            0x00, 0x00, 0x00, 0x00, // Unused Gamma Y entry for color space
-            0x00, 0x00, 0x00, 0x00, // Unused Gamma Z entry for color space
+                    0x00, 0x00, 0x00, 0x00, // Unknown
+                    0x00, 0x00, 0x00, 0x00, // Unknown
+                    0x00, 0x00, 0x00, 0x00, // Unknown
+                    0x00, 0x00, 0x00, 0x00, // Unknown
 
-            0x00, 0x00, 0x00, 0x00, // Unknown
-            0x00, 0x00, 0x00, 0x00, // Unknown
-            0x00, 0x00, 0x00, 0x00, // Unknown
-            0x00, 0x00, 0x00, 0x00, // Unknown
+                    // Image data:
+                    // 0xFF, 0x00, 0x00, 0x7F, // Bottom left pixel
+                    // 0x00, 0xFF, 0x00, 0x7F,
+                    // 0x00, 0x00, 0xFF, 0x7F,
+                    // 0xFF, 0xFF, 0xFF, 0x7F, // Bottom right pixel
+                    // 0xFF, 0x00, 0x00, 0xFF, // Top left pixel
+                    // 0x00, 0xFF, 0x00, 0xFF,
+                    // 0x00, 0x00, 0xFF, 0xFF,
+                    // 0xFF, 0xFF, 0xFF, 0xFF  // Top right pixel
+                ];
+                { // do file I/O
+                    let mut file = File::create(BITMAP_FILE)?;
+                    let mut image = Image::from_byte_array(width, &*frame);
+                    image.set_sub_frame(dimensions);
 
-            // Image data:
-            // 0xFF, 0x00, 0x00, 0x7F, // Bottom left pixel
-            // 0x00, 0xFF, 0x00, 0x7F,
-            // 0x00, 0x00, 0xFF, 0x7F,
-            // 0xFF, 0xFF, 0xFF, 0x7F, // Bottom right pixel
-            // 0xFF, 0x00, 0x00, 0xFF, // Top left pixel
-            // 0x00, 0xFF, 0x00, 0xFF,
-            // 0x00, 0x00, 0xFF, 0xFF,
-            // 0xFF, 0xFF, 0xFF, 0xFF  // Top right pixel
-        ];
-        let mut file = File::create(BITMAP_FILE)?;
-        let mut image = Image::from_byte_array(width, &*frame);
-        image.set_sub_frame(dimensions.clone());
+                    write_le_u32(18, image.width as u32, &mut bitmap_prefix_data);
+                    write_le_u32(22, image.height as u32, &mut bitmap_prefix_data);
 
-        write_le_u32(18, image.width as u32, &mut bitmap_prefix_data);
-        write_le_u32(22, image.height as u32, &mut bitmap_prefix_data);
+                    let image_total_bytes = image.total_bytes();
+                    write_le_u32(34, image_total_bytes as u32, &mut bitmap_prefix_data);
+                    write_le_u32(2, (bitmap_prefix_data.len() + image_total_bytes) as u32, &mut bitmap_prefix_data);
 
-        let image_total_bytes = image.total_bytes();
-        write_le_u32(34, image_total_bytes as u32, &mut bitmap_prefix_data);
-        write_le_u32(2, (bitmap_prefix_data.len() + image_total_bytes) as u32, &mut bitmap_prefix_data);
-
-        file.write_all(&bitmap_prefix_data)?;
-        for row in image.rows.iter().rev() {
-            file.write_all(row.to_byte_array())?;
-        }
-        file.flush()?;
-        print!("An image of the capture area has been printed to {}. \
-        Does this image encapsulate the entirety of the gamefeed and nothing else? [Y/n] ", BITMAP_FILE);
-        io::stdout().flush()?;
-        let mut response = String::new();
-        io::stdin().read_line(&mut response).unwrap();
-        if response.trim().is_empty() || response.to_lowercase().starts_with("y") {
-            break UserInput {dimensions, cap: test_cap};
+                    file.write_all(&bitmap_prefix_data)?;
+                    for row in image.rows.iter().rev() {
+                        file.write_all(row.to_byte_array())?;
+                    }
+                }
+                print!("An image of the capture area has been printed to {}. \
+                Does this image encapsulate the entirety of the gamefeed and nothing else? [Y/n] ", BITMAP_FILE);
+                io::stdout().flush()?;
+                let mut response = String::new();
+                io::stdin().read_line(&mut response).unwrap();
+                if response.trim().is_empty() || response.to_lowercase().starts_with("y") {
+                    break UserInput {dimensions, cap};
+                }
+            },
+            Err(e) => handle_capture_error(e)
         }
     };
     let mut cap = input.cap;
+    let width = cap.width();
 
     //init thread for connection to LiveSplit.Server
     match TcpStream::connect("localhost:16834") {
@@ -134,15 +146,18 @@ fn main() -> std::io::Result<()> {
                 }
             });
             loop {
-                let width = cap.width();
-                let screenshot = cap.frame()?;
-                let mut waialae_image = Image::from_byte_array(width, &*screenshot);
-                waialae_image.set_sub_frame(input.dimensions.clone());
-                if waialae_image.is_black() {
-                    livesplit_socket.send(SPLIT).unwrap();
-                    thread::sleep(time::Duration::from_secs(6));
-                } else {
-                    thread::sleep(time::Duration::from_millis(1000 / 60));
+                match cap.frame() {
+                    Ok(frame) => {
+                        let mut waialae_image = Image::from_byte_array(width, &*frame);
+                        waialae_image.set_sub_frame(input.dimensions.clone());
+                        if waialae_image.is_black() {
+                            livesplit_socket.send(SPLIT).unwrap();
+                            thread::sleep(time::Duration::from_millis(DELAY_MILLIS_AFTER_HOLE_SPLIT));
+                        } else {
+                            thread::sleep(time::Duration::from_millis(CAPTURE_SAMPLE_DELAY_MILLIS));
+                        }
+                    }
+                    Err(e) => handle_capture_error(e)
                 }
             }
         }
@@ -152,6 +167,17 @@ fn main() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+fn handle_capture_error(e: std::io::Error) -> () {
+    if e.kind() == WouldBlock {
+        //println!("Waiting on frame...");
+        thread::sleep(time::Duration::from_millis(CAPTURE_SAMPLE_DELAY_MILLIS));
+    }
+    else {
+        println!("Unknown error during screen capture: {}. Exiting", e);
+        exit(-1);
+    }
 }
 
 struct UserInput {
@@ -182,7 +208,7 @@ const GREEN_INDEX: usize = 1;
 const RED_INDEX: usize = 2;
 //Alpha = 3
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Rectangle {
     top_x: usize,
     top_y: usize,
