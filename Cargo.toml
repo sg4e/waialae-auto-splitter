@@ -8,3 +8,4 @@ edition = "2018"
 
 [dependencies]
 scrap = "0.5"
+winapi = { version = "0.3.8", features = ["winuser", "windef"] }

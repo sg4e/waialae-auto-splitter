@@ -31,6 +31,7 @@ use std::sync::mpsc;
 use std::io;
 use std::io::ErrorKind::WouldBlock;
 use std::process::exit;
+use winapi::shared::windef::POINT;
 
 const PIXEL_SIZE: usize = 4;
 const BITMAP_FILE : &str = "test.bmp";
@@ -40,92 +41,132 @@ const CAPTURE_SAMPLE_DELAY_MILLIS : u64 = 1000 / CAPTURE_SAMPLE_RATE as u64;
 const DELAY_MILLIS_AFTER_HOLE_SPLIT : u64 = 6 * 1000;
 
 fn main() -> std::io::Result<()> {
-    //TODO get mouse coordinates with Windows API
-    let top_x = 80;
-    let top_y = 80;
-    let bottom_x = 800;
-    let bottom_y = 800;
-    let dimensions = Rectangle {top_x, top_y, bottom_x, bottom_y};
-
-    let mut all_displays = Display::all().unwrap();
-    // get 2nd
-    //all_displays.pop();
-    let dis = all_displays.pop().unwrap();
-    let mut cap = Capturer::new(dis).unwrap();
-    let width = cap.width();
     let input: UserInput = loop {
-        match cap.frame() {
-            Ok(frame) => {
-                let mut bitmap_prefix_data: [u8; 138] = [
-                    0x42, 0x4D,             // Signature 'BM'
-                    0xaa, 0x00, 0x00, 0x00, // Size: 170 bytes
-                    0x00, 0x00,             // Unused
-                    0x00, 0x00,             // Unused
-                    0x8a, 0x00, 0x00, 0x00, // Offset to image data
-
-                    0x7c, 0x00, 0x00, 0x00, // DIB header size (124 bytes)
-                    0x04, 0x00, 0x00, 0x00, // Width (4px)
-                    0x02, 0x00, 0x00, 0x00, // Height (2px)
-                    0x01, 0x00,             // Planes (1)
-                    0x20, 0x00,             // Bits per pixel (32)
-                    0x03, 0x00, 0x00, 0x00, // Format (bitfield = use bitfields | no compression)
-                    0x20, 0x00, 0x00, 0x00, // Image raw size (32 bytes)
-                    0x13, 0x0B, 0x00, 0x00, // Horizontal print resolution (2835 = 72dpi * 39.3701)
-                    0x13, 0x0B, 0x00, 0x00, // Vertical print resolution (2835 = 72dpi * 39.3701)
-                    0x00, 0x00, 0x00, 0x00, // Colors in palette (none)
-                    0x00, 0x00, 0x00, 0x00, // Important colors (0 = all)
-                    0x00, 0x00, 0xFF, 0x00, // R bitmask (00FF0000)
-                    0x00, 0xFF, 0x00, 0x00, // G bitmask (0000FF00)
-                    0xFF, 0x00, 0x00, 0x00, // B bitmask (000000FF)
-                    0x00, 0x00, 0x00, 0x00, // A bitmask (FF000000)
-                    0x42, 0x47, 0x52, 0x73, // sRGB color space
-                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Unused R, G, B entries for color space
-                    0x00, 0x00, 0x00, 0x00, // Unused Gamma X entry for color space
-                    0x00, 0x00, 0x00, 0x00, // Unused Gamma Y entry for color space
-                    0x00, 0x00, 0x00, 0x00, // Unused Gamma Z entry for color space
-
-                    0x00, 0x00, 0x00, 0x00, // Unknown
-                    0x00, 0x00, 0x00, 0x00, // Unknown
-                    0x00, 0x00, 0x00, 0x00, // Unknown
-                    0x00, 0x00, 0x00, 0x00, // Unknown
-
-                    // Image data:
-                    // 0xFF, 0x00, 0x00, 0x7F, // Bottom left pixel
-                    // 0x00, 0xFF, 0x00, 0x7F,
-                    // 0x00, 0x00, 0xFF, 0x7F,
-                    // 0xFF, 0xFF, 0xFF, 0x7F, // Bottom right pixel
-                    // 0xFF, 0x00, 0x00, 0xFF, // Top left pixel
-                    // 0x00, 0xFF, 0x00, 0xFF,
-                    // 0x00, 0x00, 0xFF, 0xFF,
-                    // 0xFF, 0xFF, 0xFF, 0xFF  // Top right pixel
-                ];
-                { // do file I/O
-                    let mut file = File::create(BITMAP_FILE)?;
-                    let mut image = Image::from_byte_array(width, &*frame);
-                    image.set_sub_frame(dimensions);
-
-                    write_le_u32(18, image.width as u32, &mut bitmap_prefix_data);
-                    write_le_u32(22, image.height as u32, &mut bitmap_prefix_data);
-
-                    let image_total_bytes = image.total_bytes();
-                    write_le_u32(34, image_total_bytes as u32, &mut bitmap_prefix_data);
-                    write_le_u32(2, (bitmap_prefix_data.len() + image_total_bytes) as u32, &mut bitmap_prefix_data);
-
-                    file.write_all(&bitmap_prefix_data)?;
-                    for row in image.rows.iter().rev() {
-                        file.write_all(row.to_byte_array())?;
+        let mut all_displays = Display::all().unwrap();
+        let mut display_index: usize = 0;
+        if all_displays.len() > 1 {
+            display_index = loop {
+                println!("You have a multi-monitor setup. Enter the number associated with the monitor \
+                from which you want to capture gamefeed:");
+                for (display_number, display) in all_displays.iter().enumerate() {
+                    println!("{}: {}px x {}px", display_number + 1, display.width(), display.height());
+                }
+                let response = readline_stdin();
+                match response.parse::<usize>() {
+                    Ok(number) => {
+                        if number <= all_displays.len() {
+                            break number - 1; // user's list starts at 1 not 0
+                        } else {
+                            println!("Value {} is out of range. Try again", number);
+                        }
                     }
+                    Err(_) => println!("{} is not an acceptable value. Try again", response)
                 }
-                print!("An image of the capture area has been printed to {}. \
-                Does this image encapsulate the entirety of the gamefeed and nothing else? [Y/n] ", BITMAP_FILE);
-                io::stdout().flush()?;
-                let mut response = String::new();
-                io::stdin().read_line(&mut response).unwrap();
-                if response.trim().is_empty() || response.to_lowercase().starts_with("y") {
-                    break UserInput {dimensions, cap};
-                }
-            },
-            Err(e) => handle_capture_error(e)
+            };
+        }
+        //get 2 mouse points for capture bounds
+        let point_top_left = prompt_mouse_position("Hover your mouse over the TOP-LEFT corner of the gamefeed capture and press [Enter]");
+        let point_bottom_right = prompt_mouse_position("Hover your mouse over the BOTTOM-RIGHT corner of the gamefeed capture and press [Enter]");
+        //verify the bounds are valid
+        if point_top_left.x > point_bottom_right.x || point_top_left.y > point_bottom_right.y {
+            println!("Bottom-right corner is above or to the left of top-right corner. Try again");
+            continue;
+        }
+        //relativize bounds to specified display
+        //this assumes the displays are ordered left to right and sequentially
+        //this probably won't work on some multi-monitor setups, but I can't find anything in the winapi
+        let mut top_x : usize = point_top_left.x as usize;
+        let top_y : usize = point_top_left.y as usize;
+        let mut bottom_x : usize = point_bottom_right.x as usize;
+        let bottom_y : usize = point_bottom_right.y as usize;
+        for index in 0..display_index {
+            let width = all_displays[index].width();
+            top_x -= width;
+            bottom_x -= width;
+        }
+        let dimensions = Rectangle {top_x, top_y, bottom_x, bottom_y};
+        println!("{:?}", dimensions);
+        let dis = all_displays.remove(display_index);
+        let mut cap = Capturer::new(dis).unwrap();
+        let width = cap.width();
+        let mut user_said_yes : bool = false;
+        loop {
+            match cap.frame() {
+                Ok(frame) => {
+                    let mut bitmap_prefix_data: [u8; 138] = [
+                        0x42, 0x4D,             // Signature 'BM'
+                        0xaa, 0x00, 0x00, 0x00, // Size: 170 bytes
+                        0x00, 0x00,             // Unused
+                        0x00, 0x00,             // Unused
+                        0x8a, 0x00, 0x00, 0x00, // Offset to image data
+
+                        0x7c, 0x00, 0x00, 0x00, // DIB header size (124 bytes)
+                        0x04, 0x00, 0x00, 0x00, // Width (4px)
+                        0x02, 0x00, 0x00, 0x00, // Height (2px)
+                        0x01, 0x00,             // Planes (1)
+                        0x20, 0x00,             // Bits per pixel (32)
+                        0x03, 0x00, 0x00, 0x00, // Format (bitfield = use bitfields | no compression)
+                        0x20, 0x00, 0x00, 0x00, // Image raw size (32 bytes)
+                        0x13, 0x0B, 0x00, 0x00, // Horizontal print resolution (2835 = 72dpi * 39.3701)
+                        0x13, 0x0B, 0x00, 0x00, // Vertical print resolution (2835 = 72dpi * 39.3701)
+                        0x00, 0x00, 0x00, 0x00, // Colors in palette (none)
+                        0x00, 0x00, 0x00, 0x00, // Important colors (0 = all)
+                        0x00, 0x00, 0xFF, 0x00, // R bitmask (00FF0000)
+                        0x00, 0xFF, 0x00, 0x00, // G bitmask (0000FF00)
+                        0xFF, 0x00, 0x00, 0x00, // B bitmask (000000FF)
+                        0x00, 0x00, 0x00, 0x00, // A bitmask (FF000000)
+                        0x42, 0x47, 0x52, 0x73, // sRGB color space
+                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Unused R, G, B entries for color space
+                        0x00, 0x00, 0x00, 0x00, // Unused Gamma X entry for color space
+                        0x00, 0x00, 0x00, 0x00, // Unused Gamma Y entry for color space
+                        0x00, 0x00, 0x00, 0x00, // Unused Gamma Z entry for color space
+
+                        0x00, 0x00, 0x00, 0x00, // Unknown
+                        0x00, 0x00, 0x00, 0x00, // Unknown
+                        0x00, 0x00, 0x00, 0x00, // Unknown
+                        0x00, 0x00, 0x00, 0x00, // Unknown
+
+                        // Image data:
+                        // 0xFF, 0x00, 0x00, 0x7F, // Bottom left pixel
+                        // 0x00, 0xFF, 0x00, 0x7F,
+                        // 0x00, 0x00, 0xFF, 0x7F,
+                        // 0xFF, 0xFF, 0xFF, 0x7F, // Bottom right pixel
+                        // 0xFF, 0x00, 0x00, 0xFF, // Top left pixel
+                        // 0x00, 0xFF, 0x00, 0xFF,
+                        // 0x00, 0x00, 0xFF, 0xFF,
+                        // 0xFF, 0xFF, 0xFF, 0xFF  // Top right pixel
+                    ];
+                    { // do file I/O
+                        let mut file = File::create(BITMAP_FILE)?;
+                        let mut image = Image::from_byte_array(width, &*frame);
+                        image.set_sub_frame(dimensions);
+
+                        write_le_u32(18, image.width as u32, &mut bitmap_prefix_data);
+                        write_le_u32(22, image.height as u32, &mut bitmap_prefix_data);
+
+                        let image_total_bytes = image.total_bytes();
+                        write_le_u32(34, image_total_bytes as u32, &mut bitmap_prefix_data);
+                        write_le_u32(2, (bitmap_prefix_data.len() + image_total_bytes) as u32, &mut bitmap_prefix_data);
+
+                        file.write_all(&bitmap_prefix_data)?;
+                        for row in image.get_visible_rows().iter().rev() {
+                            file.write_all(row.to_byte_array())?;
+                        }
+                    }
+                    print!("An image of the capture area has been printed to {}. \
+                    Does this image encapsulate the entirety of the gamefeed and nothing else? [Y/n] ", BITMAP_FILE);
+                    io::stdout().flush()?;
+                    let response = readline_stdin();
+                    if response.is_empty() || response.starts_with("y") {
+                        user_said_yes = true;
+                    }
+                    break;
+                },
+                Err(e) => handle_capture_error(e)
+            }
+        }
+        if user_said_yes {
+            break UserInput {dimensions, cap};
         }
     };
     let mut cap = input.cap;
@@ -149,7 +190,7 @@ fn main() -> std::io::Result<()> {
                 match cap.frame() {
                     Ok(frame) => {
                         let mut waialae_image = Image::from_byte_array(width, &*frame);
-                        waialae_image.set_sub_frame(input.dimensions.clone());
+                        waialae_image.set_sub_frame(input.dimensions);
                         if waialae_image.is_black() {
                             livesplit_socket.send(SPLIT).unwrap();
                             thread::sleep(time::Duration::from_millis(DELAY_MILLIS_AFTER_HOLE_SPLIT));
@@ -180,6 +221,25 @@ fn handle_capture_error(e: std::io::Error) -> () {
     }
 }
 
+fn prompt_mouse_position(prompt: &str) -> POINT {
+    println!("{}", prompt);
+    readline_stdin();
+    get_mouse_position()
+}
+
+fn get_mouse_position() -> POINT {
+    use winapi::um::winuser::GetCursorPos;
+    let mut point = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut point as *mut POINT); }
+    point
+}
+
+fn readline_stdin() -> String {
+    let mut response = String::new();
+    io::stdin().read_line(&mut response).unwrap();
+    response.trim().to_lowercase()
+}
+
 struct UserInput {
     dimensions: Rectangle,
     cap: Capturer,
@@ -208,7 +268,7 @@ const GREEN_INDEX: usize = 1;
 const RED_INDEX: usize = 2;
 //Alpha = 3
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Rectangle {
     top_x: usize,
     top_y: usize,
@@ -291,10 +351,14 @@ impl Image<'_> {
         false
     }
 
+    fn get_visible_rows(&self) -> &[Row] {
+        &self.rows[self.sub_frame.top_y..self.sub_frame.bottom_y]
+    }
+
     fn set_sub_frame(&mut self, dim: Rectangle) -> () {
         for row in &mut self.rows {
             row.set_start(dim.top_x);
-            row.set_end(dim.bottom_y);
+            row.set_end(dim.bottom_x);
         }
         self.height = dim.bottom_y - dim.top_y;
         self.width = dim.bottom_x - dim.top_x;
