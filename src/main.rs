@@ -42,6 +42,19 @@ const CAPTURE_SAMPLE_DELAY_MILLIS : u64 = 1000 / CAPTURE_SAMPLE_RATE as u64;
 const DELAY_MILLIS_AFTER_HOLE_SPLIT : u64 = 8 * 1000;
 
 fn main() -> std::io::Result<()> {
+    let version = match option_env!("APPVEYOR_BUILD_VERSION") {
+        Some(val) => val,
+        None => "dev"
+    };
+    let commit_hash = match option_env!("APPVEYOR_REPO_COMMIT") {
+        Some(val) => val,
+        None => "SNAPSHOT"
+    };
+    let datetime_of_build = match option_env!("APPVEYOR_REPO_COMMIT_TIMESTAMP") {
+        Some(val) => val,
+        None => "now"
+    };
+    println!("Waialae Autosplitter v{}-{}:{}", version, commit_hash, datetime_of_build);
     let input: UserInput = loop {
         let mut all_displays = Display::all().unwrap();
         let mut display_index: usize = 0;
