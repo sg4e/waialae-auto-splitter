@@ -23,12 +23,16 @@ Waialae Autosplitter supports Windows 32- and 64-bit builds. DirectX 11 is requi
 3. Double-click on `waialae-auto-splitter.bat` to run.
 4. Follow the prompts in the console to configure your capture.
 
-Waialae Autosplitter does not currently support first and final splits (when golfer appears and when ball enters hole on Hole 18), but support for first split is planned. The following commands may be used in console for manual control as needed:
+Waialae Autosplitter does not currently support the final split (when ball enters hole on Hole 18). The following commands may be used in console for manual control as needed:
 * `[Enter]`: Split
 * `r [Enter]`: Reset
 * `s [Enter]`: Skip split
 * `u [Enter]`: Undo split
 * `[Ctrl]+C`: Exit
+
+When using Waialae Autosplitter for starting the timer (when golfer appears on Hole 1), examine the following image for guidance on how to frame the yellow shirt's capture:
+
+![Reference image for shirt capture](images/shirt_capture_example.png)
 
 ## Troubleshooting
 

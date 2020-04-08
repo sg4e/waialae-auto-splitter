@@ -40,6 +40,7 @@ const SCREEN_REFRESH_RATE : usize = 60;
 const CAPTURE_SAMPLE_RATE : usize = SCREEN_REFRESH_RATE * 2;
 const CAPTURE_SAMPLE_DELAY_MILLIS : u64 = 1000 / CAPTURE_SAMPLE_RATE as u64;
 const DELAY_MILLIS_AFTER_HOLE_SPLIT : u64 = 8 * 1000;
+const DELAY_MILLIS_YELLOW_SHIRT_PARSING_AFTER_RESET : u64 = 5 * 1000;
 
 fn main() -> std::io::Result<()> {
     let version = match option_env!("APPVEYOR_BUILD_VERSION") {
@@ -81,24 +82,32 @@ fn main() -> std::io::Result<()> {
         //get 2 mouse points for capture bounds
         let point_top_left = prompt_mouse_position("Hover your mouse over the TOP-LEFT corner of the gamefeed capture and press [Enter]");
         let point_bottom_right = prompt_mouse_position("Hover your mouse over the BOTTOM-RIGHT corner of the gamefeed capture and press [Enter]");
-        //verify the bounds are valid
-        if point_top_left.x > point_bottom_right.x || point_top_left.y > point_bottom_right.y {
-            println!("Bottom-right corner is above or to the left of top-right corner. Try again");
+        if !is_bounds_valid(&point_top_left, &point_bottom_right) {
             continue;
         }
-        //relativize bounds to specified display
-        //this assumes the displays are ordered left to right and sequentially
-        //this probably won't work on some multi-monitor setups, but I can't find anything in the winapi
-        let mut top_x : usize = point_top_left.x as usize;
-        let top_y : usize = point_top_left.y as usize;
-        let mut bottom_x : usize = point_bottom_right.x as usize;
-        let bottom_y : usize = point_bottom_right.y as usize;
-        for index in 0..display_index {
-            let width = all_displays[index].width();
-            top_x -= width;
-            bottom_x -= width;
+        let display_widths : Vec<usize> = all_displays.iter().map(|d| d.width()).collect();
+        let display_widths_until_point : &[usize] = &display_widths[0..display_index];
+        let dimensions = relativize_to_display(&point_top_left, &point_bottom_right, display_widths_until_point);
+        //get bounds for shirt parsing
+        let mut yellow_shirt_quadrant_option : Option<Rectangle> = None;
+        print!("Would you like to automatically start timer when golfer appears on Hole 1 (requires yellow-shirt golfer)? [Y/n] ");
+        io::stdout().flush()?;
+        if user_confirmed() {
+            println!("Go to Hole 1 and remain on the screen where your golfer appears. Your golfer must be wearing a yellow shirt.");
+            let shirt_top_left = prompt_mouse_position("Hover your mouse under the LEFT SHOULDER of your golfer and press [Enter]");
+            let shirt_bottom_right = prompt_mouse_position("Hover your mouse over the RIGHT SIDE above the waist of your golfer and press [Enter]");
+            if !is_bounds_valid(&point_top_left, &point_bottom_right) {
+                continue;
+            }
+            let shirt = relativize_to_display(&shirt_top_left, &shirt_bottom_right, display_widths_until_point);
+            //verify that capture area wholly contains shirt quadrant
+            if shirt.top_x < dimensions.top_x || shirt.bottom_x > dimensions.bottom_x ||
+                shirt.top_y < dimensions.top_y || shirt.bottom_y > dimensions.bottom_y {
+                println!("Shirt area is not fully inside the specified capture area. Try again");
+                continue;
+            }
+            yellow_shirt_quadrant_option = Some(shirt);
         }
-        let dimensions = Rectangle {top_x, top_y, bottom_x, bottom_y};
         let dis = all_displays.remove(display_index);
         let mut cap = Capturer::new(dis).unwrap();
         let width = cap.width();
@@ -162,15 +171,13 @@ fn main() -> std::io::Result<()> {
                         write_le_u32(2, (bitmap_prefix_data.len() + image_total_bytes) as u32, &mut bitmap_prefix_data);
 
                         file.write_all(&bitmap_prefix_data)?;
-                        for row in image.get_visible_rows().iter().rev() {
-                            file.write_all(row.to_byte_array())?;
-                        }
+                        image.write_as_bitmap(&mut file, yellow_shirt_quadrant_option)?;
                     }
                     print!("An image of the capture area has been printed to {}. \
-                    Does this image encapsulate the entirety of the gamefeed and nothing else? [Y/n] ", BITMAP_FILE);
+                    Does this image encapsulate the entirety of the gamefeed and nothing else? \
+                    If you are using autostart capabilities, do red lines mark the top and bottom of the shirt area? [Y/n] ", BITMAP_FILE);
                     io::stdout().flush()?;
-                    let response = readline_stdin();
-                    if response.is_empty() || response.starts_with("y") {
+                    if user_confirmed() {
                         user_said_yes = true;
                     }
                     break;
@@ -179,11 +186,15 @@ fn main() -> std::io::Result<()> {
             }
         }
         if user_said_yes {
-            break UserInput {dimensions, cap};
+            break UserInput {dimensions, cap, shirt_option: yellow_shirt_quadrant_option};
         }
     };
     let mut cap = input.cap;
     let width = cap.width();
+    let optional_shirt = input.shirt_option;
+    let is_shirt_processing_enabled = optional_shirt.is_some();
+    println!("Press [Enter] when you are on a neutral screen to begin image processing");
+    readline_stdin();
 
     //init thread for connection to LiveSplit.Server
     match TcpStream::connect("localhost:16834") {
@@ -238,27 +249,39 @@ fn main() -> std::io::Result<()> {
             //that processes all data the other threads send it. However, Rust requires that the Capture object not be sent to another thread.
             //Therefore, we make a control thread, and leave the image processing on the main thread.
             let image_processing_thread_handle = std::thread::current();
-            let wake_up_flag_store = Arc::new(AtomicBool::new(false));
+
+            let yellow_shirt_mode_store = Arc::new(AtomicBool::new(is_shirt_processing_enabled));
+            let yellow_shirt_mode_read =  Arc::clone(&yellow_shirt_mode_store);
+
+            let wake_up_flag_store = Arc::new(AtomicBool::new(is_shirt_processing_enabled));
             let wake_up_flag_read = Arc::clone(&wake_up_flag_store);
+
             thread::Builder::new().name("logic_control".to_string()).spawn(move || {
                 let mut hole = 0;
                 let mut playing_back_nine_interlude : bool = false;
                 loop {
-                    //TODO console-input parsing during sleep
                     match main_control_receiver.recv() {
                         Ok(control) => {
                             match control {
                                 Control::Reset => {
-                                    //sleep image-proc thread
-                                    wake_up_flag_store.store(false, Ordering::Release);
                                     livesplit_socket.send(control).unwrap();
                                     hole = 0;
                                     playing_back_nine_interlude = false;
                                     println!("Reset");
+                                    if is_shirt_processing_enabled {
+                                        yellow_shirt_mode_store.store(true, Ordering::Release);
+                                        //could be a reset after completing a run; therefore, wake up
+                                        wake_up_flag_store.store(true, Ordering::Release);
+                                        image_processing_thread_handle.unpark();
+                                    }
+                                    else {
+                                        //sleep image-proc thread
+                                        wake_up_flag_store.store(false, Ordering::Release);
+                                    }
                                 }
                                 Control::Split | Control::Start => {
                                     //this manual split input is for final hole split
-                                    //and for 1st split "when golfer becomes visible", until autosplit for 1st split is coded
+                                    //and for 1st split "when golfer becomes visible"
                                     //it can also be used to manually split if, for whatever reason, the autosplit fails
                                     if hole < 19 {
                                         hole += 1;
@@ -278,13 +301,15 @@ fn main() -> std::io::Result<()> {
                                     else {
                                         if hole == 1 {
                                             livesplit_socket.send(Control::Start).unwrap();
+                                            //switch to black-screen mode
+                                            yellow_shirt_mode_store.store(false, Ordering::Release);
                                         }
                                         else {
                                             livesplit_socket.send(Control::Split).unwrap();
                                         }
                                         println!("Hole {}", hole);
                                         if hole == 1 {
-                                            //wake image-proc thread
+                                            //wake image-proc thread if asleep
                                             wake_up_flag_store.store(true, Ordering::Release);
                                             image_processing_thread_handle.unpark();
                                         }
@@ -311,15 +336,40 @@ fn main() -> std::io::Result<()> {
                     }
                 }
             }).unwrap();
+            let mut state = {
+                if is_shirt_processing_enabled {
+                    ImageProcessingState::YellowShirt
+                }
+                else {
+                    ImageProcessingState::BlackScreen
+                }
+            };
             loop {
+                let mut just_woke_up = false;
                 while !wake_up_flag_read.load(Ordering::Acquire) {
                     thread::park();
+                    just_woke_up = true;
+                }
+                if yellow_shirt_mode_read.load(Ordering::Acquire) {
+                    if state == ImageProcessingState::BlackScreen && !just_woke_up {
+                        //thread wakes up after setting up image bounds; after wake up, processing should be ready immediately
+                        //else, this is after a reset and give player time to get off screen with their golfer
+                        thread::sleep(time::Duration::from_millis(DELAY_MILLIS_YELLOW_SHIRT_PARSING_AFTER_RESET));
+                    }
+                    state = ImageProcessingState::YellowShirt;
+                }
+                else {
+                    state = ImageProcessingState::BlackScreen;
                 }
                 match cap.frame() {
                     Ok(frame) => {
                         let mut waialae_image = Image::from_byte_array(width, &*frame);
                         waialae_image.set_sub_frame(input.dimensions);
-                        if waialae_image.is_black() {
+                        let has_triggered_split = match state {
+                            ImageProcessingState::YellowShirt => waialae_image.is_yellow(&optional_shirt.unwrap()),
+                            ImageProcessingState::BlackScreen => waialae_image.is_black()
+                        };
+                        if has_triggered_split {
                             img_proc_main_control_handle.send(Control::Split).unwrap();
                             thread::sleep(time::Duration::from_millis(DELAY_MILLIS_AFTER_HOLE_SPLIT));
                         } else {
@@ -338,6 +388,12 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+#[derive(PartialEq)]
+enum ImageProcessingState {
+    YellowShirt,
+    BlackScreen,
+}
+
 fn handle_capture_error(e: std::io::Error) -> () {
     if e.kind() == WouldBlock {
         //println!("Waiting on frame...");
@@ -347,6 +403,11 @@ fn handle_capture_error(e: std::io::Error) -> () {
         println!("Unknown error during screen capture: {}. Exiting", e);
         exit(-1);
     }
+}
+
+fn user_confirmed() -> bool {
+    let response = readline_stdin();
+    response.is_empty() || response.starts_with("y")
 }
 
 fn prompt_mouse_position(prompt: &str) -> POINT {
@@ -362,6 +423,28 @@ fn get_mouse_position() -> POINT {
     point
 }
 
+fn is_bounds_valid(top_left: &POINT, bottom_right: &POINT) -> bool {
+    if top_left.x > bottom_right.x || top_left.y > bottom_right.y {
+        println!("Bottom-right corner is above or to the left of top-right corner. Try again");
+        return false;
+    }
+    true
+}
+
+fn relativize_to_display(top_left: &POINT, bottom_right: &POINT, display_widths_until_point: &[usize]) -> Rectangle {
+    //this assumes the displays are ordered left to right and sequentially
+    //this probably won't work on some multi-monitor setups, but I can't find anything in the winapi
+    let mut top_x : usize = top_left.x as usize;
+    let top_y : usize = top_left.y as usize;
+    let mut bottom_x : usize = bottom_right.x as usize;
+    let bottom_y : usize = bottom_right.y as usize;
+    for width in display_widths_until_point {
+        top_x -= width;
+        bottom_x -= width;
+    }
+    Rectangle {top_x, top_y, bottom_x, bottom_y}
+}
+
 fn readline_stdin() -> String {
     let mut response = String::new();
     io::stdin().read_line(&mut response).unwrap();
@@ -371,6 +454,7 @@ fn readline_stdin() -> String {
 struct UserInput {
     dimensions: Rectangle,
     cap: Capturer,
+    shirt_option : Option<Rectangle>,
 }
 
 enum Control {
@@ -411,6 +495,15 @@ fn is_black(pixel: &[u8]) -> bool {
         pixel[RED_INDEX] < BLACK_THRESHOLD
 }
 
+fn is_yellow(pixel: &[u8]) -> bool {
+    let blue_pixel = pixel[BLUE_INDEX];
+    let green_pixel = pixel[GREEN_INDEX];
+    let red_pixel = pixel[RED_INDEX];
+    blue_pixel < 100 &&
+        green_pixel < 230 && green_pixel > 140 &&
+        red_pixel > 160
+}
+
 struct Row<'a> {
     pixels: &'a[u8],
     start: usize, //inclusive, in bytes, not pixels
@@ -435,6 +528,16 @@ impl Row<'_> {
             }
         }
         count
+    }
+
+    /// Returns a slice
+    /// 
+    /// # Arguments
+    /// 
+    /// * `start` - first pixel (not bytes), inclusive
+    /// * `end` - last pixel (not bytes), exclusive
+    fn slice(&self, start: usize, end: usize) -> &[u8] {
+        &self.pixels[start * PIXEL_SIZE .. end * PIXEL_SIZE]
     }
 
     fn set_start(&mut self, start: usize) -> () {
@@ -479,6 +582,21 @@ impl Image<'_> {
         false
     }
 
+    fn is_yellow(&self, subquadrant : &Rectangle) -> bool {
+        let threshold = 95; //percent
+        let pixel_count : usize = (subquadrant.bottom_x - subquadrant.top_x) * (subquadrant.bottom_y - subquadrant.top_y);
+        let trigger : usize = pixel_count * threshold / 100;
+        let mut count : usize = 0;
+        for row in &self.rows[subquadrant.top_y..subquadrant.bottom_y] {
+            let target_pixels : &[u8] = row.slice(subquadrant.top_x, subquadrant.bottom_x);
+            count += target_pixels.chunks(PIXEL_SIZE).filter(|pixel| is_yellow(pixel)).count();
+            if count >= trigger {
+                return true;
+            }
+        }
+        false
+    }
+
     fn get_visible_rows(&self) -> &[Row] {
         &self.rows[self.sub_frame.top_y..self.sub_frame.bottom_y]
     }
@@ -495,6 +613,34 @@ impl Image<'_> {
 
     fn total_bytes(&self) -> usize {
         self.height * self.width * PIXEL_SIZE
+    }
+
+    fn write_as_bitmap(&self, file : &mut File, shirt_quadrant : Option<Rectangle>) -> std::io::Result<()> {
+        for enumeration in self.get_visible_rows().iter().enumerate().rev() {
+            //visible rows only!
+            let (visible_index, row) = enumeration;
+            let index = self.sub_frame.top_y + visible_index;
+            match shirt_quadrant {
+                Some(dim) => {
+                    if dim.top_y == index || dim.bottom_y == index {
+                        let mut row_bytes : Vec<u8> = row.pixels.to_vec();
+                        for row_index in dim.top_x..dim.bottom_x {
+                            let pixel_start = row_index * PIXEL_SIZE;
+                            //red line
+                            row_bytes[pixel_start + 0] = 0x0;
+                            row_bytes[pixel_start + 1] = 0x0;
+                            row_bytes[pixel_start + 2] = 0xFF;
+                        }
+                        file.write_all(&row_bytes[self.sub_frame.top_x * PIXEL_SIZE .. self.sub_frame.bottom_x * PIXEL_SIZE])?;
+                    }
+                    else {
+                        file.write_all(row.to_byte_array())?;
+                    }
+                }
+                None => file.write_all(row.to_byte_array())?
+            };
+        }
+        Ok(())
     }
 
 }
