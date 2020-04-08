@@ -30,17 +30,42 @@ use std::sync::{Arc, atomic::{Ordering, AtomicBool}};
 use std::net::{TcpStream};
 use std::sync::mpsc;
 use std::io;
-use std::io::ErrorKind::WouldBlock;
+use std::io::ErrorKind::{WouldBlock, NotFound};
 use std::process::exit;
 use winapi::shared::windef::POINT;
+use serde::{Serialize, Deserialize};
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct WaialaeConfig {
+    bitmap_file: String,
+    screen_refresh_rate: usize,
+    capture_sample_rate: usize,
+    capture_sample_delay_millis: u64,
+    delay_millis_after_hole_split: u64,
+    delay_millis_yellow_shirt_parsing_after_reset: u64,
+    capture_region: Option<ScreenRegion>,
+    shirt_region: Option<ScreenRegion>,
+}
+
+impl WaialaeConfig {
+    fn default() -> WaialaeConfig {
+        let screen_refresh_rate = 60;
+        let capture_sample_rate = screen_refresh_rate * 2;
+        WaialaeConfig {
+            bitmap_file: String::from("test.bmp"),
+            screen_refresh_rate,
+            capture_sample_rate,
+            capture_sample_delay_millis: 1000 / capture_sample_rate as u64,
+            delay_millis_after_hole_split: 8 * 1000,
+            delay_millis_yellow_shirt_parsing_after_reset: 5 * 1000,
+            capture_region: Option::None,
+            shirt_region: Option::None,
+        }
+    }
+}
 
 const PIXEL_SIZE: usize = 4;
-const BITMAP_FILE : &str = "test.bmp";
-const SCREEN_REFRESH_RATE : usize = 60;
-const CAPTURE_SAMPLE_RATE : usize = SCREEN_REFRESH_RATE * 2;
-const CAPTURE_SAMPLE_DELAY_MILLIS : u64 = 1000 / CAPTURE_SAMPLE_RATE as u64;
-const DELAY_MILLIS_AFTER_HOLE_SPLIT : u64 = 8 * 1000;
-const DELAY_MILLIS_YELLOW_SHIRT_PARSING_AFTER_RESET : u64 = 5 * 1000;
+const CONFIG_FILENAME : &str = "config.yml";
 
 fn main() -> std::io::Result<()> {
     let version = match option_env!("APPVEYOR_BUILD_VERSION") {
@@ -56,59 +81,95 @@ fn main() -> std::io::Result<()> {
         None => "now"
     };
     println!("Waialae Autosplitter v{}-{}:{}", version, commit_hash, datetime_of_build);
-    let input: UserInput = loop {
-        let mut all_displays = Display::all().unwrap();
-        let mut display_index: usize = 0;
-        if all_displays.len() > 1 {
-            display_index = loop {
-                println!("You have a multi-monitor setup. Enter the number associated with the monitor \
-                from which you want to capture gamefeed:");
-                for (display_number, display) in all_displays.iter().enumerate() {
-                    println!("{}: {}px x {}px", display_number + 1, display.width(), display.height());
-                }
-                let response = readline_stdin();
-                match response.parse::<usize>() {
-                    Ok(number) => {
-                        if number <= all_displays.len() {
-                            break number - 1; // user's list starts at 1 not 0
-                        } else {
-                            println!("Value {} is out of range. Try again", number);
+    //read config file
+    let mut config : WaialaeConfig = match File::open(CONFIG_FILENAME) {
+        Ok(f) => {
+            match serde_yaml::from_reader(f) {
+                Ok(c) => {
+                    let mut wc : WaialaeConfig = c; //because type annotation
+                    if wc.capture_region.is_some() {
+                        if !prompt_user("Would you like to use the same capture bounds as last time?", false) {
+                            wc.capture_region = None;
+                            wc.shirt_region = None;
                         }
                     }
-                    Err(_) => println!("{} is not an acceptable value. Try again", response)
+                    wc
+                },
+                Err(e) => {
+                    println!("Error inside configuration file: {}", e);
+                    WaialaeConfig::default()
                 }
-            };
-        }
-        //get 2 mouse points for capture bounds
-        let point_top_left = prompt_mouse_position("Hover your mouse over the TOP-LEFT corner of the gamefeed capture and press [Enter]");
-        let point_bottom_right = prompt_mouse_position("Hover your mouse over the BOTTOM-RIGHT corner of the gamefeed capture and press [Enter]");
-        if !is_bounds_valid(&point_top_left, &point_bottom_right) {
-            continue;
-        }
-        let display_widths : Vec<usize> = all_displays.iter().map(|d| d.width()).collect();
-        let display_widths_until_point : &[usize] = &display_widths[0..display_index];
-        let dimensions = relativize_to_display(&point_top_left, &point_bottom_right, display_widths_until_point);
-        //get bounds for shirt parsing
-        let mut yellow_shirt_quadrant_option : Option<Rectangle> = None;
-        print!("Would you like to automatically start timer when golfer appears on Hole 1 (requires yellow-shirt golfer)? [Y/n] ");
-        io::stdout().flush()?;
-        if user_confirmed() {
-            println!("Go to Hole 1 and remain on the screen where your golfer appears. Your golfer must be wearing a yellow shirt.");
-            let shirt_top_left = prompt_mouse_position("Hover your mouse under the LEFT SHOULDER of your golfer and press [Enter]");
-            let shirt_bottom_right = prompt_mouse_position("Hover your mouse over the RIGHT SIDE above the waist of your golfer and press [Enter]");
-            if !is_bounds_valid(&point_top_left, &point_bottom_right) {
-                continue;
             }
-            let shirt = relativize_to_display(&shirt_top_left, &shirt_bottom_right, display_widths_until_point);
-            //verify that capture area wholly contains shirt quadrant
-            if shirt.top_x < dimensions.top_x || shirt.bottom_x > dimensions.bottom_x ||
-                shirt.top_y < dimensions.top_y || shirt.bottom_y > dimensions.bottom_y {
-                println!("Shirt area is not fully inside the specified capture area. Try again");
-                continue;
-            }
-            yellow_shirt_quadrant_option = Some(shirt);
+        },
+        Err(ref e) if e.kind() == NotFound => {
+            println!("No previous configuration was found. Configuration will be saved to {}", CONFIG_FILENAME);
+            WaialaeConfig::default()
         }
-        let dis = all_displays.remove(display_index);
+        Err(e) => {
+            println!("Error trying to read configuration file: {}", e);
+            WaialaeConfig::default()
+        }
+    };
+    let mut cap : Capturer = loop {
+        let mut all_displays = Display::all().unwrap();
+        match config.capture_region {
+            Some(_) => (),
+            None => {
+                let mut display_index: usize = 0;
+                if all_displays.len() > 1 {
+                    display_index = loop {
+                        println!("You have a multi-monitor setup. Enter the number associated with the monitor \
+                        from which you want to capture gamefeed:");
+                        for (display_number, display) in all_displays.iter().enumerate() {
+                            println!("{}: {}px x {}px", display_number + 1, display.width(), display.height());
+                        }
+                        let response = readline_stdin();
+                        match response.parse::<usize>() {
+                            Ok(number) => {
+                                if number <= all_displays.len() {
+                                    break number - 1; // user's list starts at 1 not 0
+                                } else {
+                                    println!("Value {} is out of range. Try again", number);
+                                }
+                            }
+                            Err(_) => println!("{} is not an acceptable value. Try again", response)
+                        }
+                    };
+                }
+                //get 2 mouse points for capture bounds
+                let point_top_left = prompt_mouse_position("Hover your mouse over the TOP-LEFT corner of the gamefeed capture and press [Enter]");
+                let point_bottom_right = prompt_mouse_position("Hover your mouse over the BOTTOM-RIGHT corner of the gamefeed capture and press [Enter]");
+                if !is_bounds_valid(&point_top_left, &point_bottom_right) {
+                    continue;
+                }
+                let display_widths : Vec<usize> = all_displays.iter().map(|d| d.width()).collect();
+                let display_widths_until_point : &[usize] = &display_widths[0..display_index];
+                let dimensions = relativize_to_display(&point_top_left, &point_bottom_right, display_widths_until_point);
+                //get bounds for shirt parsing
+                print!("Would you like to automatically start timer when golfer appears on Hole 1 (requires yellow-shirt golfer)? [Y/n] ");
+                io::stdout().flush()?;
+                if user_confirmed() {
+                    println!("Go to Hole 1 and remain on the screen where your golfer appears. Your golfer must be wearing a yellow shirt.");
+                    let shirt_top_left = prompt_mouse_position("Hover your mouse under the LEFT SHOULDER of your golfer and press [Enter]");
+                    let shirt_bottom_right = prompt_mouse_position("Hover your mouse over the RIGHT SIDE above the waist of your golfer and press [Enter]");
+                    if !is_bounds_valid(&point_top_left, &point_bottom_right) {
+                        continue;
+                    }
+                    let shirt = relativize_to_display(&shirt_top_left, &shirt_bottom_right, display_widths_until_point);
+                    //verify that capture area wholly contains shirt quadrant
+                    if shirt.top_x < dimensions.top_x || shirt.bottom_x > dimensions.bottom_x ||
+                        shirt.top_y < dimensions.top_y || shirt.bottom_y > dimensions.bottom_y {
+                        println!("Shirt area is not fully inside the specified capture area. Try again");
+                        continue;
+                    }
+                    config.shirt_region = Some(ScreenRegion {display_index, dimensions: shirt});
+                }
+
+                config.capture_region = Some(ScreenRegion {display_index, dimensions});
+            }
+        };
+        let capture_region = config.capture_region.unwrap();
+        let dis = all_displays.remove(capture_region.display_index);
         let mut cap = Capturer::new(dis).unwrap();
         let width = cap.width();
         let mut user_said_yes : bool = false;
@@ -159,9 +220,9 @@ fn main() -> std::io::Result<()> {
                         // 0xFF, 0xFF, 0xFF, 0xFF  // Top right pixel
                     ];
                     { // do file I/O
-                        let mut file = File::create(BITMAP_FILE)?;
+                        let mut file = File::create(&config.bitmap_file)?;
                         let mut image = Image::from_byte_array(width, &*frame);
-                        image.set_sub_frame(dimensions);
+                        image.set_sub_frame(capture_region.dimensions);
 
                         write_le_u32(18, image.width as u32, &mut bitmap_prefix_data);
                         write_le_u32(22, image.height as u32, &mut bitmap_prefix_data);
@@ -171,28 +232,42 @@ fn main() -> std::io::Result<()> {
                         write_le_u32(2, (bitmap_prefix_data.len() + image_total_bytes) as u32, &mut bitmap_prefix_data);
 
                         file.write_all(&bitmap_prefix_data)?;
-                        image.write_as_bitmap(&mut file, yellow_shirt_quadrant_option)?;
+                        image.write_as_bitmap(&mut file, &config.shirt_region)?;
                     }
                     print!("An image of the capture area has been printed to {}. \
                     Does this image encapsulate the entirety of the gamefeed and nothing else? \
-                    If you are using autostart capabilities, do red lines mark the top and bottom of the shirt area? [Y/n] ", BITMAP_FILE);
+                    If you are using autostart capabilities, do red lines mark the top and bottom of the shirt area? [Y/n] ", config.bitmap_file);
                     io::stdout().flush()?;
                     if user_confirmed() {
                         user_said_yes = true;
                     }
                     break;
                 },
-                Err(e) => handle_capture_error(e)
+                Err(e) => handle_capture_error(e, config.capture_sample_delay_millis)
             }
         }
         if user_said_yes {
-            break UserInput {dimensions, cap, shirt_option: yellow_shirt_quadrant_option};
+            match File::create(CONFIG_FILENAME) {
+                Ok(writer) => {
+                    match serde_yaml::to_writer(writer, &config) {
+                        Ok(_) => (),
+                        Err(e) => println!("Error serializing configuration data to file: {}", e)
+                    }
+                },
+                Err(e) => println!("Could not save configuration data to file: {}", e)
+            }
+            break cap;
         }
     };
-    let mut cap = input.cap;
     let width = cap.width();
-    let optional_shirt = input.shirt_option;
+    let dimensions = config.capture_region.unwrap().dimensions;
+    let optional_shirt = config.shirt_region;
     let is_shirt_processing_enabled = optional_shirt.is_some();
+    let yellow_shirt_unwrapped = match optional_shirt {
+        Some(region) => region.dimensions,
+        //filler for `null` so we don't unwrap every single time in shirt-parsing mode
+        None => Rectangle {top_x: 0, top_y: 0, bottom_x: 6000, bottom_y: 600}
+    };
     println!("Press [Enter] when you are on a neutral screen to begin image processing");
     readline_stdin();
 
@@ -354,7 +429,7 @@ fn main() -> std::io::Result<()> {
                     if state == ImageProcessingState::BlackScreen && !just_woke_up {
                         //thread wakes up after setting up image bounds; after wake up, processing should be ready immediately
                         //else, this is after a reset and give player time to get off screen with their golfer
-                        thread::sleep(time::Duration::from_millis(DELAY_MILLIS_YELLOW_SHIRT_PARSING_AFTER_RESET));
+                        thread::sleep(time::Duration::from_millis(config.delay_millis_yellow_shirt_parsing_after_reset));
                     }
                     state = ImageProcessingState::YellowShirt;
                 }
@@ -364,19 +439,19 @@ fn main() -> std::io::Result<()> {
                 match cap.frame() {
                     Ok(frame) => {
                         let mut waialae_image = Image::from_byte_array(width, &*frame);
-                        waialae_image.set_sub_frame(input.dimensions);
+                        waialae_image.set_sub_frame(dimensions);
                         let has_triggered_split = match state {
-                            ImageProcessingState::YellowShirt => waialae_image.is_yellow(&optional_shirt.unwrap()),
+                            ImageProcessingState::YellowShirt => waialae_image.is_yellow(&yellow_shirt_unwrapped),
                             ImageProcessingState::BlackScreen => waialae_image.is_black()
                         };
                         if has_triggered_split {
                             img_proc_main_control_handle.send(Control::Split).unwrap();
-                            thread::sleep(time::Duration::from_millis(DELAY_MILLIS_AFTER_HOLE_SPLIT));
+                            thread::sleep(time::Duration::from_millis(config.delay_millis_after_hole_split));
                         } else {
-                            thread::sleep(time::Duration::from_millis(CAPTURE_SAMPLE_DELAY_MILLIS));
+                            thread::sleep(time::Duration::from_millis(config.capture_sample_delay_millis));
                         }
                     }
-                    Err(e) => handle_capture_error(e)
+                    Err(e) => handle_capture_error(e, config.capture_sample_delay_millis)
                 }
             }
         }
@@ -394,15 +469,25 @@ enum ImageProcessingState {
     BlackScreen,
 }
 
-fn handle_capture_error(e: std::io::Error) -> () {
+fn handle_capture_error(e: std::io::Error, capture_sample_delay_millis: u64) -> () {
     if e.kind() == WouldBlock {
         //println!("Waiting on frame...");
-        thread::sleep(time::Duration::from_millis(CAPTURE_SAMPLE_DELAY_MILLIS));
+        thread::sleep(time::Duration::from_millis(capture_sample_delay_millis));
     }
     else {
         println!("Unknown error during screen capture: {}. Exiting", e);
         exit(-1);
     }
+}
+
+fn prompt_user(prompt: &str, is_yes_default: bool) -> bool {
+    let options : &str = match is_yes_default {
+        true => "[Y/n]",
+        false => "[y/N]"
+    };
+    print!("{} {} ", prompt, options);
+    io::stdout().flush().unwrap();
+    user_confirmed()
 }
 
 fn user_confirmed() -> bool {
@@ -451,12 +536,6 @@ fn readline_stdin() -> String {
     response.trim().to_lowercase()
 }
 
-struct UserInput {
-    dimensions: Rectangle,
-    cap: Capturer,
-    shirt_option : Option<Rectangle>,
-}
-
 enum Control {
     Start,
     Reset,
@@ -480,7 +559,13 @@ const GREEN_INDEX: usize = 1;
 const RED_INDEX: usize = 2;
 //Alpha = 3
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+struct ScreenRegion {
+    display_index: usize,
+    dimensions: Rectangle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 struct Rectangle {
     top_x: usize,
     top_y: usize,
@@ -615,13 +700,14 @@ impl Image<'_> {
         self.height * self.width * PIXEL_SIZE
     }
 
-    fn write_as_bitmap(&self, file : &mut File, shirt_quadrant : Option<Rectangle>) -> std::io::Result<()> {
+    fn write_as_bitmap(&self, file : &mut File, shirt_quadrant : &Option<ScreenRegion>) -> std::io::Result<()> {
         for enumeration in self.get_visible_rows().iter().enumerate().rev() {
             //visible rows only!
             let (visible_index, row) = enumeration;
             let index = self.sub_frame.top_y + visible_index;
             match shirt_quadrant {
-                Some(dim) => {
+                Some(sr) => {
+                    let dim = sr.dimensions;
                     if dim.top_y == index || dim.bottom_y == index {
                         let mut row_bytes : Vec<u8> = row.pixels.to_vec();
                         for row_index in dim.top_x..dim.bottom_x {

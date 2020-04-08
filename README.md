@@ -39,8 +39,3 @@ When using Waialae Autosplitter for starting the timer (when golfer appears on H
 *A window pops up indicating a library or DLL is missing.*
 
 Make sure you have installed the latest [Microsoft C++ Redistributable](https://support.microsoft.com/en-us/help/2977003/the-latest-supported-visual-c-downloads).
-
-## TO-DO
-
-- Add autosplit capability for start of run (when golfer appears)
-- Move hardcoded settings to standalone configuration file
